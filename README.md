@@ -106,6 +106,14 @@ docker compose logs -f agentworks
 - `GET /monitor`
 - `POST /eval/run`
 
+服务启动后可运行固定的 10 条 RAG 业务验收集：
+
+```bash
+python -m evaluation.rag_retrieval_evaluator --base-url http://localhost:8000
+```
+
+该验收只检查正确知识标题、无答案拒答、最多返回 3 个父块和父块去重，不做不必要的消融实验。
+
 ## 项目结构
 
 ```text

@@ -690,8 +690,9 @@ POST /eval/jobs/{id}/cancel -> 取消
 
 本次 RAG 重构已核对：
 
-- `python -m pytest -q`：24 项测试通过。
+- `python -m pytest -q`：30 项测试通过，其中 6 项覆盖固定 RAG 验收集和评测器约束。
 - 本地 Qdrant 引擎真实执行了 Dense 与中文 BM25 双路预取、默认 RRF 融合和父块读取冒烟测试。
+- 已建立 10 条固定 RAG 业务验收集及命令行评测器，待完整 API 环境运行并校准 Gate。
 - `docker compose config --quiet` 通过。
 - Docker Desktop 后端因本机遗留 `dockerInference` socket 启动失败，因此本次未完成整套 Compose 容器和 HTTP 端到端验证；`docker compose config --quiet` 已通过。
 

@@ -452,7 +452,7 @@
 
 **参考回答【代码可核实】：**
 
-> 当前仓库有 24 项自动化测试，除原有 Agent 角色契约、工具隔离、Composer 和 Tool Calling 外，新增覆盖父子切块、父块/子块存储边界、默认 RRF、父块延迟读取、证据 Gate、Gate 触发的单次改写，以及上下文指代只改写一次。本机 `python -m pytest -q` 已全部通过，并用本地 Qdrant 引擎完成了真实混合检索冒烟测试。完整 Compose 因本机 Docker Desktop 后端启动异常仍需另行验证。
+> 当前仓库有 30 项自动化测试，除原有 Agent 角色契约、工具隔离、Composer 和 Tool Calling 外，新增覆盖父子切块、父块/子块存储边界、默认 RRF、父块延迟读取、证据 Gate、单次改写，以及固定 RAG 验收集的格式和判定约束。本机 `python -m pytest -q` 已全部通过，并用本地 Qdrant 引擎完成了真实混合检索冒烟测试。完整 Compose 因本机 Docker Desktop 后端启动异常仍需另行验证。
 
 ### Q60：如果让你补测试，优先补什么？
 
@@ -992,5 +992,5 @@
 - 已核实：AgentWorks 侧的 19 类意图、三路融合、结构化路由、主辅并行、工具白名单、Qdrant 混合 RAG、Redis + ChromaDB 记忆、Skills、Monitor、LLM-as-Judge 和 Docker Compose；实习源码侧的 Cesium/Mars3D 固定航线漫游与 PostGIS + pgRouting 生活圈；GeoAgent 后端侧的 FastAPI、同步 SQLAlchemy/GeoAlchemy2、LangGraph 两节点循环、五类 Tool、内存会话、SSE 状态流、PostGIS POI 查询、六项选址指标和 Session 区域流向。
 - 未核实：约 500 条 AgentWorks 数据集及四个效果数字、真实生产流量、实习中的通用三维标绘与 POI 聚合、RAGFlow、道路 DDL/索引/拓扑和生活圈精度；GeoAgent 的实习归属、个人贡献、真实 LLM 联调、生产数据库与索引、T10e-2 checkpoint 和评测报告、业务口径与选址效果。
 - 发现实现边界：AgentWorks 的 RAG Gate 阈值尚未用固定业务问题校准，长期记忆仍在 ChromaDB，动态路由默认单实例，缓存、熔断和监控仍有演示型限制；GeoAgent 的未知地点静默回退东京、只保留首个 Tool Call、公共参数校验不递归、内存会话不持久化、推荐与指标 Router 未注册、指标 JSON 标为 mock、缺少鉴权限流与生产观测。
-- AgentWorks 本机验证：`python -m compileall -q api agents core mcp memory monitor evaluation tests` 通过，`python -m pytest -q` 为 24 项全部通过，本地 Qdrant 混合检索冒烟测试通过；完整 Docker Compose 启动尚未在本轮验证。
+- AgentWorks 本机验证：`python -m compileall -q api agents core mcp memory monitor evaluation tests` 通过，`python -m pytest -q` 为 30 项全部通过，本地 Qdrant 混合检索冒烟测试通过；完整 Docker Compose 启动尚未在本轮验证。
 - GeoAgent 本轮本机验证：直接 `python -m pytest -q` 因 `tests.conftest` 包名冲突产生 8 个收集错误；无代码修改地规避冲突后执行 185 个用例，179 个通过、6 个推荐 API 用例因 Router 未注册而失败。当前 `DATABASE_URL` 对应库未安装 PostGIS 且无业务表。

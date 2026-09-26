@@ -1,0 +1,62 @@
+[
+  {
+    "id": "refund_window",
+    "query": "购买后多久以内可以无理由退款？",
+    "expected_titles": ["退款政策"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "refund_arrival",
+    "query": "退款审核通过后几天能到账？",
+    "expected_titles": ["退款政策"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "shipment_tracking_delay",
+    "query": "发货后物流信息通常多久更新？",
+    "expected_titles": ["订单查询"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "account_2fa",
+    "query": "怎样给账户开启双重验证？",
+    "expected_titles": ["账户安全"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "login_401",
+    "query": "登录时报 401 是什么意思？",
+    "expected_titles": ["技术故障排查"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "app_crash",
+    "query": "应用总是闪退应该怎么排查？",
+    "expected_titles": ["技术故障排查"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "gold_member_discount",
+    "query": "金卡会员购物能打几折？",
+    "expected_titles": ["会员与积分"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "remote_delivery",
+    "query": "偏远地区配送一般要多等几天？",
+    "expected_titles": ["配送说明"],
+    "expect_sufficient": true
+  },
+  {
+    "id": "unknown_store_address",
+    "query": "北京线下门店的地址在哪里？",
+    "expected_titles": [],
+    "expect_sufficient": false
+  },
+  {
+    "id": "unknown_weather",
+    "query": "明天上海天气怎么样？",
+    "expected_titles": [],
+    "expect_sufficient": false
+  }
+]

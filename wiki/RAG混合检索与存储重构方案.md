@@ -1,6 +1,6 @@
 # RAG 混合检索与存储重构方案
 
-> 状态：知识检索主链路已实施；固定测试集、来源清单和长期记忆迁移待完成
+> 状态：知识检索主链路和固定验收集已实施；线上阈值校准、来源清单和长期记忆迁移待完成
 >
 > 适用项目：AgentWorks / EchoMind
 >
@@ -472,7 +472,7 @@ rag_parents_active  → rag_parents_v2
 6. [x] 接入 CrossEncoder；
 7. [x] 接入 Retrieval Sufficiency Gate；
 8. [x] 接入单次条件查询改写和无答案回退；
-9. [ ] 使用固定问题集验证质量和延迟，再决定是否调整 RRF 默认参数。
+9. [ ] 已建立 10 条固定业务验收集和命令行评测器；待完整环境运行后校准 Gate，再决定是否调整 RRF 默认参数。
 
 ### 第二阶段：切换线上 RAG
 
@@ -493,7 +493,13 @@ rag_parents_active  → rag_parents_v2
 
 ## 12. 最小验证方案
 
-本项目不需要完整科研式消融实验，只保留一套用于证明选型有效的固定测试集。
+本项目不需要完整科研式消融实验，只保留一套用于证明选型有效的固定测试集。当前用例位于 `evaluation/cases/rag_retrieval_cases.json`，服务启动后执行：
+
+```bash
+python -m evaluation.rag_retrieval_evaluator --base-url http://localhost:8000
+```
+
+评测器只输出通过数、失败数、通过率和逐条失败原因，不生成无法解释的“综合分”。
 
 测试问题建议覆盖：
 
