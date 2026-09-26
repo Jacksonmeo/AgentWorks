@@ -65,7 +65,7 @@
 
 > AgentWorks 是一个面向客服场景的多 Agent 编排运行时。请求进入 `/chat` 后，系统先从 Redis 和 ChromaDB 读取当前会话、历史摘要和用户画像，再用 LLM Few-shot、字符 n-gram 相似度和 Pattern 三路融合识别 19 类意图，同时提取订单号、金额、日期和错误码等实体。  
 > Orchestrator 根据意图、关键词和实体计算 General、Technical、Billing 的领域得分；人工升级由独立 Escalation 节点处理。复合问题会生成主 Agent 和辅助 Agent 并行执行，再由 Composer 合并结果。各 Agent 有不同角色契约和工具白名单，知识库检索作为共享工具提供。  
-> RAG 侧使用 ChromaDB，支持查询改写、多个子查询并行召回、去重和 LLM 重排，工具层还做了缓存、超时、熔断与 fallback。最后系统写回记忆，并通过 Monitor 和 Evaluator 暴露运行指标、LLM-as-Judge 评分和回归检测。  
+> RAG 侧使用 Qdrant：父子切块后由中文 Dense 与 BM25 并行召回，使用默认 RRF 融合、CrossEncoder 重排和证据充分性 Gate；只有指代不清、问题过短或首轮证据不足时才改写一次，通过 Gate 后才读取 Top3 父块。工具层还做了缓存、超时、熔断与 fallback。最后系统写回记忆，并通过 Monitor 和 Evaluator 暴露运行指标、LLM-as-Judge 评分和回归检测。
 > 当前仓库能证明这些机制存在，但效果数字和生产规模仍需要独立实验报告支撑，我不会把设计能力等同于生产验证结果。
 
 **面试官可能继续追问：**为什么是多 Agent、RAG 到底何时触发、三路融合怎么投票、指标怎么测、失败如何降级。
@@ -164,7 +164,7 @@
 **参考回答【代码可核实，容易答错】：**
 
 > 意图识别分支会先检查客户端是否提供 embeddings 接口；如果没有，就使用本地 256 维字符 n-gram 哈希向量。标准 Anthropic SDK 当前通常没有该 embeddings 资源，因此不能把这一支笼统说成高质量语义 Embedding 模型。  
-> ChromaDB 知识库和长期记忆的向量化是另一条链路，当前依赖 ChromaDB 默认 embedding。两者必须区分。
+> RAG 知识库使用显式的 `BAAI/bge-small-zh-v1.5`，与意图识别的本地哈希向量完全分离；ChromaDB 当前只保留长期记忆，仍使用它自己的向量化链路。三者必须区分。
 
 ### Q16：为什么权重是 0.7 / 0.2 / 0.1？
 
@@ -218,19 +218,19 @@
 
 **参考回答【代码可核实】：**
 
-> 文档先按约 500 字、尽量按句号边界切片并写入 ChromaDB。检索时 LLM 生成三个改写查询，同时保留原查询，所以最多是四路并行召回；合并结果后去重，再由 LLM 返回相关性顺序，截取 Top-K。工具管理器还提供 300 秒缓存、默认 30 秒超时、三态熔断和 fallback。
+> 文档先按标题层级和语义边界生成约 900 token 父块，再生成约 240 token、40 token 重叠的子块。子块在 Qdrant 中同时保存中文 Dense 和 BM25 表示，查询时各召回 Top20，使用 Qdrant 默认 RRF 融合为 12 个候选，再由 `bge-reranker-base` 重排。Gate 通过后才按 `parent_id` 去重并批量读取最多 3 个父块；不足时最多改写重试一次，仍不足则拒答。工具层另有 300 秒缓存、90 秒 RAG 超时、三态熔断和 fallback。
 
 ### Q24：查询改写、召回、重排各解决什么问题？
 
 **参考回答：**
 
-> 查询改写解决用户表达和知识库措辞不一致；多路召回提高候选覆盖率；重排解决向量距离不完全等价于任务相关性的问题。它们分别主要影响召回、候选覆盖和排序质量，但也会增加模型调用、延迟与成本，所以不能对所有问题无条件开启。
+> Dense 解决语义近似，BM25 补足专有名词、错误码和关键词精确命中，RRF 在两种分数不可直接比较时按排名稳定融合，CrossEncoder 再用 query-document 交互提升前排精度。查询改写只负责补全上下文指代或在首轮证据不足时重试，不能默认扇出，否则会增加延迟并扩大问题范围。
 
-### Q25：你说“3 路并行召回”，到底是 3 路还是 4 路？
+### Q25：为什么只做 Dense 与 BM25 两路召回，不再生成多个子查询？
 
 **参考回答【代码可核实】：**
 
-> `rewrite_query(query, n=3)` 会返回原查询加三个改写结果，去重后最多四个查询。因此简历更准确的表述是“生成 3 个改写子查询，并保留原查询并行召回”，而不是简单说只有三路。
+> 当前项目数据量不大，核心矛盾是语义召回和关键词召回互补，而不是查询数量不够。每次都生成多个子查询会带来额外 LLM 调用、重复候选和更高延迟，因此固定为 Dense + BM25 两路；只有指代不清、问题过短或首轮 Gate 不通过时，才生成一个完整查询并重试一次。
 
 ### Q26：意图门控 RAG 是如何生效的？
 
@@ -238,35 +238,35 @@
 
 > 意图识别结果会随请求传给目标 Agent。Agent 对查询、请求、投诉、技术、账单、订单、物流、退款等业务意图预取一次共享知识库；问候和反馈直接跳过 RAG。预取成功后，检索结果被注入当前消息，并关闭后续知识库工具规划，避免同一轮重复检索。
 
-### Q27：如何去重？现在的实现有什么问题？
+### Q27：父块如何去重，为什么延迟读取？
 
 **参考回答【代码可核实】：**
 
-> 当前对整个结果对象的字符串做 MD5。问题是对象里包含 `score`，同一文档在不同查询下得分变化时，序列化内容也会变化，可能没有真正去重。更稳妥的键应是文档 ID，或 `title + chunk_index + content_hash`；同时保留多路中的最高分和命中来源。
+> 重排阶段只处理轻量子块。Gate 通过后，按排序后的 `parent_id` 去重，保留每个父块最高排名的子块，再一次批量 Retrieve 最多 3 个父块。这样同一父块的多个子块不会重复注入，候选阶段也不会反复传输大段父正文。
 
-### Q28：重排失败怎么办？如何防止非法索引？
-
-**参考回答【代码可核实】：**
-
-> 重排要求 LLM 返回索引数组，只接受 `0 <= i < len(items)` 的索引；解析或调用失败就返回原始顺序的 Top-K。当前还应补充索引去重、缺失候选回填和结构化 Schema 校验，否则模型可能重复索引或漏掉结果。
-
-### Q29：ChromaDB 的 score 是余弦相似度吗？
-
-**参考回答【代码可核实，当前有风险】：**
-
-> 当前代码用 `1 - distance` 生成 score，并在注释里称为相似度，但 collection 创建时没有显式设置 `hnsw:space=cosine`。因此不能严格保证这个数就是余弦相似度；它更多是展示值。应显式指定距离度量，并根据 ChromaDB 返回语义正确转换，评测也不要直接把该展示值当概率。
-
-### Q30：文档切片为什么是 500 字？有 overlap 吗？
+### Q28：为什么用 CrossEncoder，不继续用生成式 LLM 重排？
 
 **参考回答【代码可核实】：**
 
-> 500 字是简单经验值，代码尽量按句号或换行边界切分，没有 overlap，也没有按标题层级和 Token 计算。好处是实现简单；缺点是跨块信息可能丢失。要证明 500 最合适，需要在真实问答集上对 chunk size、overlap、Top-K 做检索评测，而不是凭经验下结论。
+> CrossEncoder 直接为 query-child 对输出相关性分数，结果确定、无需解析生成文本，也比额外调用大模型更容易控制成本和延迟。当前使用 `BAAI/bge-reranker-base`，只重排 RRF 后的 12 个子块；模型异常会进入工具 fallback，而不是把未重排候选伪装成可靠证据。
+
+### Q29：RRF 为什么不写死 `k=60`？
+
+**参考回答【代码可核实】：**
+
+> 第一版调用 `models.Rrf()`，不设置 `k` 或权重，直接使用仓库锁定的 Qdrant 版本默认行为。`k=60` 是常见经验值但不是项目事实；等固定问题集建立后，再根据召回与延迟结果决定是否显式调整，避免把参数经验当成结论。
+
+### Q30：为什么采用父子切块？参数怎么定？
+
+**参考回答【代码可核实】：**
+
+> 小子块更适合检索和 CrossEncoder 判断，较大父块能保留回答所需上下文，所以检索 child、返回 parent。当前用轻量 token 估算，父块上限 900、子块上限 240、重叠 40，并优先按 Markdown 标题、段落和句子边界切分。这些是工程初值，不声称最优；后续只需用一组固定业务问题做小范围校准。
 
 ### Q31：缓存、超时、熔断是怎样实现的？
 
 **参考回答【代码可核实】：**
 
-> 工具调用顺序是缓存检查、熔断检查、Schema 参数校验、`asyncio.wait_for` 执行、可选重排和缓存写入。默认工具超时 30 秒；连续失败 5 次打开熔断，60 秒后进入 half-open，成功则关闭，失败则重新打开。知识库工具配置了 300 秒进程内 TTL 缓存。
+> 工具调用顺序是缓存检查、熔断检查、Schema 参数校验、`asyncio.wait_for` 执行和缓存写入。连续失败 5 次打开熔断，60 秒后进入 half-open，成功则关闭，失败则重新打开。知识库工具配置了 300 秒进程内 TTL 缓存和可配置的 90 秒超时，以覆盖模型首次加载；重排属于知识库内部链路。
 
 ### Q32：这套熔断器能直接用于生产吗？
 
@@ -278,7 +278,7 @@
 
 **参考回答【代码可核实】：**
 
-> 当前 fallback 成功生成降级内容时，`ToolResult.success` 为 true，同时保留 `error`。这样上游还能继续回答，但“工具业务成功”和“系统成功降级”混在一个字段里。更严谨的结果应区分 `status=success/degraded/failed` 或增加 `fallback_used`，监控也分别统计，否则成功率可能被美化。
+> fallback 仍保持 `ToolResult.success=true`，表示调用链可以继续，但数据中会明确返回空结果和 `sufficient=false`，同时保留错误原因；Agent system prompt 被要求不得用常识补写业务事实。生产化时仍可进一步增加 `status=success/degraded/failed`，让监控不把成功降级等同于真实检索命中。
 
 ### Q34：如何计算“检索召回率 91.2%”？
 
@@ -296,7 +296,7 @@
 
 **参考回答：**
 
-> 最坏路径包括一次意图 LLM、一次查询改写、最多四次并行向量检索、一次重排、Agent 一到三轮 LLM，多 Agent 时还要并行多个 Agent 并调用 Composer。向量检索本身未必最慢，主要延迟和成本来自多次 LLM。优化方向是严格门控、缓存、候选数上限、按问题复杂度跳过改写或重排、不同阶段使用更轻模型，并记录分阶段 P50/P95；当前仓库没有 P95 压测报告。
+> 常规路径不调用改写 LLM，主要成本是本地中文 Embedding、Qdrant 两路召回、12 个候选的 CrossEncoder 和最终 Agent 生成；最坏路径会因 Gate 不通过增加一次改写和整轮重试。首次模型下载/加载以及最终生成通常最慢。后续应记录各阶段 P50/P95、模型 warm/cold 延迟和 Gate 重试率；当前仓库还没有完整压测报告。
 
 ---
 
@@ -446,14 +446,13 @@
 
 **参考回答【代码可核实】：**
 
-> Docker Compose 编排 AgentWorks、Redis、ChromaDB、Prometheus 和 Nginx，配置健康检查、数据卷和服务依赖。Nginx 做入口代理，Prometheus 抓取 `/metrics`。需要注意仓库默认 Redis 密码只适合本地演示，生产应使用 secret 管理、网络隔离、TLS、鉴权和镜像版本固定。
+> Docker Compose 编排 AgentWorks、Redis、ChromaDB、Qdrant、Prometheus 和 Nginx。Qdrant 固定版本并持久化 RAG 数据，单独的模型卷缓存 FastEmbed 模型；ChromaDB 当前只承载过渡期长期记忆。Nginx 做入口代理，Prometheus 抓取 `/metrics`。默认 Redis 密码只适合本地演示，生产还需 secret、网络隔离、TLS 和鉴权。
 
 ### Q59：当前测试覆盖到什么程度？
 
 **参考回答【代码可核实】：**
 
-> 仓库有 9 个单元测试，主要覆盖 Agent 角色契约、工具隔离、人工升级节点、Composer fallback、共享 RAG 工具、工具参数校验和一次 Tool Calling 往返。它没有覆盖意图融合、RAG 门控、记忆压缩、熔断状态机、并行路由、Monitor 反馈和 API 集成。  
-> 本次检查中 Python 编译通过，但本机缺少 `anthropic` 依赖，`pytest` 在收集阶段失败，所以我不能说当前环境测试已全部通过。
+> 当前仓库有 24 项自动化测试，除原有 Agent 角色契约、工具隔离、Composer 和 Tool Calling 外，新增覆盖父子切块、父块/子块存储边界、默认 RRF、父块延迟读取、证据 Gate、Gate 触发的单次改写，以及上下文指代只改写一次。本机 `python -m pytest -q` 已全部通过，并用本地 Qdrant 引擎完成了真实混合检索冒烟测试。完整 Compose 因本机 Docker Desktop 后端启动异常仍需另行验证。
 
 ### Q60：如果让你补测试，优先补什么？
 
@@ -828,8 +827,8 @@
 | 19 类细粒度意图 | 代码可核实 | 可以讲，最好能现场列出并解释大类 / 细类关系 |
 | LLM + Embedding + Pattern 三路融合 | 代码可核实 | 可以讲；必须说明意图 Embedding 常走字符 n-gram fallback |
 | 91.3%、Macro-F1 0.89、约 500 条 | 无数据集 / 报告 | 补齐完整证据，否则删除 |
-| 意图门控 RAG | 有辅助函数，但未接入 `/chat` | 改为“设计门控机制，当前 RAG 由 Agent 工具触发”，或先修代码和测试 |
-| 查询改写、多路召回、去重、重排 | 代码可核实 | 可以讲，同时主动说明最多四个查询和当前去重缺陷 |
+| 意图门控 RAG | 已接入 Agent 执行链路 | 可以讲；问候和反馈跳过，业务意图预取共享知识库 |
+| 父子切块、Dense + BM25、默认 RRF、CrossEncoder、Gate、条件改写 | 代码和测试可核实 | 可以讲；说明 Gate 阈值仍需固定问题集校准 |
 | 回答准确率 88.7%、召回率 91.2% | 无检索评测实现 / 报告 | 补证，否则删除 |
 | 缓存、超时、熔断、fallback | 工具层可核实 | 限定为“工具层”；不要扩展成所有 Agent 调用都有超时 |
 | General、Technical、Billing 协作 | 代码可核实 | 补充还有 Escalation 确定性节点 |
@@ -990,8 +989,8 @@
 
 ## 附：本次仓库核验摘要
 
-- 已核实：AgentWorks 侧的 19 类意图、三路融合、结构化路由、主辅并行、工具白名单、RAG、Redis + ChromaDB 记忆、Skills、Monitor、LLM-as-Judge 和 Docker Compose；实习源码侧的 Cesium/Mars3D 固定航线漫游与 PostGIS + pgRouting 生活圈；GeoAgent 后端侧的 FastAPI、同步 SQLAlchemy/GeoAlchemy2、LangGraph 两节点循环、五类 Tool、内存会话、SSE 状态流、PostGIS POI 查询、六项选址指标和 Session 区域流向。
+- 已核实：AgentWorks 侧的 19 类意图、三路融合、结构化路由、主辅并行、工具白名单、Qdrant 混合 RAG、Redis + ChromaDB 记忆、Skills、Monitor、LLM-as-Judge 和 Docker Compose；实习源码侧的 Cesium/Mars3D 固定航线漫游与 PostGIS + pgRouting 生活圈；GeoAgent 后端侧的 FastAPI、同步 SQLAlchemy/GeoAlchemy2、LangGraph 两节点循环、五类 Tool、内存会话、SSE 状态流、PostGIS POI 查询、六项选址指标和 Session 区域流向。
 - 未核实：约 500 条 AgentWorks 数据集及四个效果数字、真实生产流量、实习中的通用三维标绘与 POI 聚合、RAGFlow、道路 DDL/索引/拓扑和生活圈精度；GeoAgent 的实习归属、个人贡献、真实 LLM 联调、生产数据库与索引、T10e-2 checkpoint 和评测报告、业务口径与选址效果。
-- 发现实现边界：AgentWorks 的 RAG 门控未接 `/chat`、动态路由默认单实例、缓存/Chroma/超时/去重/监控仍有演示型限制；GeoAgent 的未知地点静默回退东京、只保留首个 Tool Call、公共参数校验不递归、内存会话不持久化、推荐与指标 Router 未注册、指标 JSON 标为 mock、缺少鉴权限流与生产观测。
-- AgentWorks 先前本机验证：`python -m compileall -q api core agents memory mcp monitor evaluation` 通过；`python -m pytest -q` 因缺少 `anthropic` 在收集阶段失败，未实际执行 9 个测试。
+- 发现实现边界：AgentWorks 的 RAG Gate 阈值尚未用固定业务问题校准，长期记忆仍在 ChromaDB，动态路由默认单实例，缓存、熔断和监控仍有演示型限制；GeoAgent 的未知地点静默回退东京、只保留首个 Tool Call、公共参数校验不递归、内存会话不持久化、推荐与指标 Router 未注册、指标 JSON 标为 mock、缺少鉴权限流与生产观测。
+- AgentWorks 本机验证：`python -m compileall -q api agents core mcp memory monitor evaluation tests` 通过，`python -m pytest -q` 为 24 项全部通过，本地 Qdrant 混合检索冒烟测试通过；完整 Docker Compose 启动尚未在本轮验证。
 - GeoAgent 本轮本机验证：直接 `python -m pytest -q` 因 `tests.conftest` 包名冲突产生 8 个收集错误；无代码修改地规避冲突后执行 185 个用例，179 个通过、6 个推荐 API 用例因 Router 未注册而失败。当前 `DATABASE_URL` 对应库未安装 PostGIS 且无业务表。

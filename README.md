@@ -4,8 +4,8 @@ AgentWorks 是一个面向客服/运营场景的多 Agent 智能系统。它不�
 
 - 细粒度意图识别
 - 路由驱动的多 Agent 编排
-- 意图驱动 RAG 检索
-- Redis + ChromaDB 分层记忆
+- 意图驱动的 Qdrant 混合 RAG
+- Redis + ChromaDB 分层记忆（长期记忆迁移中）
 - 动态 Skills 注入
 - 在线监控与路由降权
 - LLM-as-Judge 端到端评测
@@ -94,6 +94,8 @@ docker compose logs -f agentworks
 - `POST /knowledge/upload`
 - `GET /knowledge/stats`
 
+知识检索使用父子切块，子块执行中文 Dense 与 BM25 并行召回、Qdrant 默认 RRF 融合和 CrossEncoder 重排。重排后的证据先通过充分性判断，证据不足时最多改写一次；通过后才批量读取 Top3 父块。
+
 ### Skills
 
 - `GET /skills`
@@ -112,8 +114,8 @@ agents/agent_orchestrator.py 多 Agent 编排
 core/intent_recognizer.py    三路融合意图识别
 core/skill_loader.py         动态 Skills 加载
 memory/conversation_memory.py  Redis + ChromaDB 记忆
-mcp/tool_manager.py          工具层、缓存、熔断、重排
-mcp/knowledge_base.py        ChromaDB 知识库
+mcp/tool_manager.py          工具层、缓存、熔断、条件改写
+mcp/knowledge_base.py        Qdrant 混合检索知识库
 monitor/performance_monitor.py 在线监控
 evaluation/evaluator.py      端到端评测
 wiki/                       详细文档
@@ -142,6 +144,7 @@ data/                       持久化数据
 |---|---:|
 | AgentWorks API | 8000 |
 | ChromaDB | 8001 |
+| Qdrant | 6333 |
 | Redis | 6379 |
 | Prometheus | 9090 |
 | Nginx | 80 |

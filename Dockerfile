@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app
 
-# curl 用于健康检查；不再需要 gcc/g++（已移除本地 ML 模型）
+# curl 用于健康检查；FastEmbed 使用 ONNX wheel，不需要 gcc/g++。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -47,8 +47,8 @@ COPY --from=dependencies --chown=agentworks:agentworks /root/.cache/chroma /home
 COPY --chown=agentworks:agentworks . .
 
 # 创建必要目录，只调整运行期需要写入的目录权限，避免递归 chown 整个应用。
-RUN mkdir -p /app/data/chroma /app/logs /app/config && \
-    chown agentworks:agentworks /app/data /app/data/chroma /app/logs /app/config
+RUN mkdir -p /app/data/chroma /app/data/models /app/logs /app/config && \
+    chown agentworks:agentworks /app/data /app/data/chroma /app/data/models /app/logs /app/config
 USER agentworks
 
 EXPOSE 8000
@@ -63,7 +63,7 @@ FROM dependencies AS development
 
 COPY . .
 
-RUN mkdir -p /app/data/chroma /app/logs /app/config /app/tests && \
+RUN mkdir -p /app/data/chroma /app/data/models /app/logs /app/config /app/tests && \
     chmod -R 777 /app/data /app/logs
 
 EXPOSE 8000

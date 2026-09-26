@@ -189,6 +189,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "knowledge_search",
             query,
             top_k=top_k,
+            context={"history": req.history or []},
         )
         if not getattr(result, "success", False):
             return {
@@ -205,6 +206,14 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "top_k": top_k,
             "results": result.data,
             "reranked": bool(getattr(result, "reranked", False)),
+            "sufficient": getattr(result, "sufficient", None),
+            "rewritten": bool(getattr(result, "rewritten", False)),
+            "query_used": getattr(result, "query_used", query),
+            "message": (
+                "已找到足够的知识库证据"
+                if getattr(result, "sufficient", None) is not False
+                else "当前知识库中没有足够证据回答该问题"
+            ),
         }
 
     return {

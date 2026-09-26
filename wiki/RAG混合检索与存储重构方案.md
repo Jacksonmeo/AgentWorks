@@ -1,6 +1,6 @@
 # RAG 混合检索与存储重构方案
 
-> 状态：设计方案，尚未实施
+> 状态：知识检索主链路已实施；固定测试集、来源清单和长期记忆迁移待完成
 >
 > 适用项目：AgentWorks / EchoMind
 >
@@ -464,23 +464,23 @@ rag_parents_active  → rag_parents_v2
 
 ### 第一阶段：建设新的知识检索链路
 
-1. 在 Docker Compose 中增加 Qdrant，并固定版本；
-2. 建立 `rag_children_v1` 和 `rag_parents_v1`；
-3. 实现父子切块和原始文件清单；
-4. 接入显式中文 Embedding；
-5. 接入 Qdrant BM25、Dense 与 RRF；
-6. 接入 CrossEncoder；
-7. 接入 Retrieval Sufficiency Gate；
-8. 接入单次条件查询改写和无答案回退；
-9. 使用固定问题集验证质量和延迟，再决定是否调整 RRF 默认参数。
+1. [x] 在 Docker Compose 中增加 Qdrant，并固定为 `v1.19.1`；
+2. [x] 建立 `rag_children_v1` 和 `rag_parents_v1`；
+3. [x] 实现父子切块；原始文件来源清单待补；
+4. [x] 接入显式中文 Embedding；
+5. [x] 接入 Qdrant BM25、Dense 与默认 RRF；
+6. [x] 接入 CrossEncoder；
+7. [x] 接入 Retrieval Sufficiency Gate；
+8. [x] 接入单次条件查询改写和无答案回退；
+9. [ ] 使用固定问题集验证质量和延迟，再决定是否调整 RRF 默认参数。
 
 ### 第二阶段：切换线上 RAG
 
-1. 保留旧实现作为临时回退；
-2. 新旧链路对同一批问题执行对比；
-3. 确认写入、查询、更新、删除均正常；
-4. 默认流量切换至 Qdrant；
-5. 删除旧知识库检索实现。
+1. [x] 知识检索默认切换至 Qdrant；
+2. [x] 删除旧 ChromaDB 知识库检索实现；
+3. [x] 为写入、混合检索、重排、Gate、父块延迟读取和条件改写补充自动化测试；
+4. [ ] 在完整 Compose 环境验证模型首次下载、导入、查询和无答案路径；
+5. [ ] 补齐显式删除接口与 Qdrant alias 无停机换版流程。
 
 ### 第三阶段：统一长期记忆存储
 

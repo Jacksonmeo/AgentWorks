@@ -396,6 +396,8 @@ class BaseAgent:
                 "latency_ms": round((time.monotonic() - tool_t0) * 1000, 1),
                 "cached": False,
                 "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
+                "sufficient": result.get("sufficient") if isinstance(result, dict) else None,
+                "rewritten": bool(result.get("rewritten")) if isinstance(result, dict) else False,
                 "error": error_text,
             })
 
@@ -552,7 +554,8 @@ class BaseAgent:
             f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
             f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
             "默认先给结论，再给必要步骤；保持简洁，但必须把句子、步骤和 Markdown 结构完整写完。\n"
-            "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
+            "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。\n"
+            "如果知识库结果标记 sufficient=false，不得依据常识补写业务结论，必须明确说明当前知识库证据不足。"
         )
         base_prompt = f"{self.system_prompt}{profile_prompt}"
         if self._skill_manager is None:

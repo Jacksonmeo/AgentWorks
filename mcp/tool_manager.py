@@ -5,7 +5,7 @@
 
 本模块的答案：
   1. 直接检索优先 —— 正常召回时立即返回，减少不必要的模型调用。
-  2. 查询改写与重排 —— 直接检索无结果时再扩写查询并重排，解决召回不足。
+  2. 条件查询改写 —— 只在指代不清、问题过短或证据不足时改写一次。
   3. 熔断器（Circuit Breaker）—— 连续失败超阈值时自动断开，防止雪崩。
   4. 结果缓存（TTL Cache）—— 相同参数直接返回缓存，减少重复调用。
   5. 降级策略（Fallback）—— 工具不可用时返回有意义的降级结果。
@@ -15,10 +15,11 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
@@ -44,6 +45,9 @@ class ToolResult:
     cached:         bool = False
     latency_ms:     float = 0.0
     reranked:       bool = False   # 是否经过重排
+    sufficient:     Optional[bool] = None
+    rewritten:      bool = False
+    query_used:     Optional[str] = None
 
 
 @dataclass
@@ -114,7 +118,6 @@ class Tool:
     schema:      Dict[str, Any]              # JSON Schema
     cache_ttl:   float = 0.0                 # 0 = 不缓存
     timeout_s:   float = 30.0
-    supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
 
     # 运行时状态（不参与构造）
@@ -128,8 +131,8 @@ class MCPToolManager:
     """
     MCP 工具调用框架。
 
-    检索链路：
-      用户查询 → 直接召回；无结果时 → 查询改写 → 并行召回 → 结果重排
+    RAG 检索链路：
+      用户查询 → 一轮混合检索；证据不足时 → 改写一次 → 重试；仍不足则拒答。
     """
 
     def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
@@ -139,7 +142,7 @@ class MCPToolManager:
         self._client = AsyncAnthropic(**kwargs)
         self._model  = model
         self._tools: Dict[str, Tool] = {}
-        self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
+        self._cache: Dict[str, tuple] = {}   # key → (result, expire_at)
 
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 
@@ -159,31 +162,29 @@ class MCPToolManager:
         context: Optional[Dict[str, Any]] = None,
         *,
         use_cache: bool = True,
-        rerank_top_k: int = 0,          # >0 时对结果重排，取 Top-K
     ) -> ToolResult:
         """
         调用工具，完整执行链：
-          缓存检查 → 熔断检查 → 参数校验 → 执行（含超时）→ 可选重排 → 缓存写入
+          缓存检查 → 熔断检查 → 参数校验 → 执行（含超时）→ 缓存写入
         """
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
 
-        cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
-
         # 缓存命中
         if use_cache and tool.cache_ttl > 0:
-            cached = self._get_cache(name, params, cache_rerank_top_k)
+            cached = self._get_cache(name, params)
             if cached is not None:
-                cached_data, cached_reranked = cached
                 tool.stats.total += 1
                 tool.stats.success += 1
                 return ToolResult(
                     success=True,
-                    data=cached_data,
+                    data=cached,
                     tool_name=name,
                     cached=True,
-                    reranked=cached_reranked,
+                    reranked=bool(cached.get("reranked")) if isinstance(cached, dict) else False,
+                    sufficient=cached.get("sufficient") if isinstance(cached, dict) else None,
+                    query_used=cached.get("query") if isinstance(cached, dict) else None,
                 )
 
         # 熔断检查
@@ -205,18 +206,16 @@ class MCPToolManager:
             tool.stats.total_latency_ms += latency
             tool.breaker.record_success()
 
-            # 重排（针对返回列表的检索工具）
-            reranked = False
-            if rerank_top_k > 0 and tool.supports_rerank and isinstance(data, list):
-                query = params.get("query", "")
-                data, reranked = await self._rerank(query, data, rerank_top_k), True
+            reranked = bool(data.get("reranked")) if isinstance(data, dict) else False
+            sufficient = data.get("sufficient") if isinstance(data, dict) else None
+            query_used = data.get("query") if isinstance(data, dict) else None
 
-            # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
             if tool.cache_ttl > 0:
-                self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked)
+                self._set_cache(name, params, data, tool.cache_ttl)
 
             return ToolResult(success=True, data=data, tool_name=name,
-                              latency_ms=latency, reranked=reranked)
+                              latency_ms=latency, reranked=reranked,
+                              sufficient=sufficient, query_used=query_used)
 
         except asyncio.TimeoutError:
             tool.stats.failed += 1
@@ -275,38 +274,38 @@ class MCPToolManager:
             return await result
         return result
 
-    # ── 查询改写（解决召回不全）────────────────────────────────────────────────
+    # ── 条件查询改写 ───────────────────────────────────────────────────────────
 
-    async def rewrite_query(self, query: str, n: int = 3) -> List[str]:
-        """
-        用 LLM 将原始查询改写为 n 个不同角度的子查询。
+    async def rewrite_query(
+        self,
+        query: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """将问题改写为一个语义完整的检索查询，不生成多路变体。"""
+        context_text = self._rewrite_context(context)
+        prompt = f"""请把用户问题改写成一个可独立检索知识库的完整查询。
+要求：
+1. 只补全对话中已经出现的指代、实体和意图，不扩展问题范围；
+2. 只输出一条改写后的查询，不要解释、编号或 JSON；
+3. 如果信息不足以补全，原样返回用户问题。
 
-        目的：单一查询往往只能召回某一角度的文档，
-        多角度子查询并行检索后合并，显著提升召回率。
+最近对话：
+{context_text or "（无）"}
 
-        示例：
-          原始: "退款流程"
-          改写: ["如何申请退款", "退款需要多少天", "退款政策是什么"]
-        """
-        prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
-要求：每个子查询角度不同，覆盖原始问题的不同方面。
-原始查询: "{query}"
-返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
-        prompt = self._clean_text(prompt)
+用户问题：{query}"""
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
+                model=self._model,
+                max_tokens=128,
+                temperature=0.0,
                 extra_body={"thinking": {"type": "disabled"}},
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": self._clean_text(prompt)}],
             )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            queries = json.loads(raw[s:e])
-            # 原始查询也保留，去重
-            return list(dict.fromkeys([query] + queries))
+            rewritten = extract_text_content(resp.content).strip().strip('"“”')
+            return rewritten or query
         except Exception as ex:
-            logger.warning(f"查询改写失败，使用原始查询: {ex}")
-            return [query]
+            logger.warning("查询改写失败，使用原始查询: %s", ex)
+            return query
 
     async def search_with_rewrite(
         self,
@@ -315,118 +314,152 @@ class MCPToolManager:
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
-        """
-        直接检索优先；无结果时再执行查询改写 → 并行召回 → 去重 → 重排。
+        """至多改写一次；第二轮仍不足时返回明确的无证据结果。"""
+        original_query = str(query or "").strip()
+        if not original_query:
+            return ToolResult(
+                success=False,
+                data=[],
+                tool_name=tool_name,
+                error="query 不能为空",
+                sufficient=False,
+            )
 
-        小型知识库通常一次检索已经足够，避免为每次查询额外调用两次 LLM。
-        """
-        direct = await self.call(
+        effective_query = original_query
+        rewritten = False
+        if self._should_rewrite_before_search(original_query, context):
+            effective_query = await self.rewrite_query(original_query, context)
+            rewritten = effective_query.strip() != original_query
+
+        first = await self.call(
             tool_name,
-            {"query": query, "top_k": top_k},
+            {"query": effective_query, "top_k": top_k},
             context,
             use_cache=True,
         )
-        if direct.success and isinstance(direct.data, list) and direct.data:
-            # 重复导入的文档可能只在 score 等字段上有差异；按标题和正文去重，
-            # 避免把相同知识片段重复塞进模型上下文。
-            seen_direct = set()
-            unique_direct = []
-            for item in direct.data:
-                if isinstance(item, dict):
-                    key = (
-                        str(item.get("title", "")).strip(),
-                        str(item.get("content", "")).strip(),
-                    )
-                else:
-                    key = ("", str(item).strip())
-                if key in seen_direct:
-                    continue
-                seen_direct.add(key)
-                unique_direct.append(item)
-            direct.data = unique_direct[:top_k]
-            return direct
+        normalized = self._normalize_search_result(first, top_k, rewritten, effective_query)
+        if not first.success or normalized.sufficient is not False:
+            return normalized
 
-        # 直接检索无结果时，再生成多角度子查询。
-        sub_queries = await self.rewrite_query(query, n=3)
-        sub_queries = [item for item in sub_queries if item.strip() != query.strip()]
-        logger.info(f"查询改写: {query!r} → {sub_queries}")
+        if rewritten:
+            normalized.error = normalized.error or "改写后仍没有足够证据"
+            return normalized
 
-        # 并行召回：所有补充子查询同时检索
-        recall_k = max(top_k, 5)
-        tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
-            for q in sub_queries
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+        retry_query = await self.rewrite_query(original_query, context)
+        if retry_query.strip() == original_query:
+            normalized.error = normalized.error or "没有足够证据，且查询无法进一步改写"
+            return normalized
 
-        # 合并去重（按内容哈希去重）
-        seen, merged = set(), []
-        for r in results:
-            if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
-                for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(item)
+        logger.info("证据不足，查询改写后重试: %r → %r", original_query, retry_query)
+        retry = await self.call(
+            tool_name,
+            {"query": retry_query, "top_k": top_k},
+            context,
+            use_cache=True,
+        )
+        result = self._normalize_search_result(retry, top_k, True, retry_query)
+        if result.sufficient is False:
+            result.error = result.error or "改写后仍没有足够证据"
+        return result
 
-        if not merged:
-            return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
+    @classmethod
+    def _normalize_search_result(
+        cls,
+        result: ToolResult,
+        top_k: int,
+        rewritten: bool,
+        query_used: str,
+    ) -> ToolResult:
+        if not result.success:
+            result.rewritten = rewritten
+            result.query_used = query_used
+            return result
 
-        # 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        if isinstance(result.data, dict):
+            payload = result.data
+            items = payload.get("results", [])
+            result.data = cls._deduplicate_results(items, top_k)
+            result.reranked = bool(payload.get("reranked", result.reranked))
+            result.sufficient = bool(payload.get("sufficient", False))
+            result.error = None if result.sufficient else str(payload.get("reason") or "证据不足")
+        elif isinstance(result.data, list):
+            # 兼容非 RAG 检索工具和测试替身；非空列表视为已有可用结果。
+            result.data = cls._deduplicate_results(result.data, top_k)
+            result.sufficient = bool(result.data)
+        else:
+            result.data = []
+            result.sufficient = False
+            result.error = "检索工具返回了无法识别的数据结构"
 
-    # ── 结果重排（解决召回不好）──────────────────────────────────────────────
+        result.rewritten = rewritten
+        result.query_used = query_used
+        return result
 
-    async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
-        """
-        用 LLM 对召回结果重新打分排序。
+    @staticmethod
+    def _deduplicate_results(items: Any, top_k: int) -> List[Any]:
+        if not isinstance(items, list):
+            return []
+        seen = set()
+        unique = []
+        for item in items:
+            if isinstance(item, dict):
+                key = item.get("parent_id") or (
+                    str(item.get("title", "")).strip(),
+                    str(item.get("content", "")).strip(),
+                )
+            else:
+                key = str(item).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+            if len(unique) >= top_k:
+                break
+        return unique
 
-        解决问题：向量检索的相似度分数不等于"对用户有用"，
-        LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
-        """
-        if len(items) <= top_k:
-            return items
+    @classmethod
+    def _should_rewrite_before_search(
+        cls,
+        query: str,
+        context: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not cls._rewrite_context(context):
+            return False
+        compact = re.sub(r"[\s，。！？、,.!?;；:：]", "", query)
+        context_dependent = bool(re.search(r"它|这个|那个|上述|前面|刚才|该问题|该订单", query))
+        has_explicit_code = bool(re.search(r"[A-Za-z]*\d{3,}", query))
+        too_short = len(compact) <= 6 and not has_explicit_code
+        return context_dependent or too_short
 
-        # 将结果序列化为文本供 LLM 评分
-        items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
-                               for i, item in enumerate(items))
-        prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
-用户查询: "{query}"
-检索结果:
-{items_text}
-
-返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
-只返回 JSON 数组，不要其他文字。"""
-        prompt = self._clean_text(prompt)
-
-        try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                extra_body={"thinking": {"type": "disabled"}},
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
-        except Exception as ex:
-            logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+    @staticmethod
+    def _rewrite_context(context: Optional[Dict[str, Any]]) -> str:
+        if not context:
+            return ""
+        history = context.get("history") if isinstance(context, dict) else None
+        if not isinstance(history, list):
+            return ""
+        lines = []
+        for item in history[-4:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "user"))
+            content = str(item.get("content", "")).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines)[-1600:]
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
-    def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0) -> str:
-        payload = {"params": params, "rerank_top_k": rerank_top_k}
+    def _cache_key(self, name: str, params: Dict) -> str:
+        payload = {"params": params}
         return f"{name}:{hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
 
-    def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0) -> Optional[Tuple[Any, bool]]:
-        key = self._cache_key(name, params, rerank_top_k)
+    def _get_cache(self, name: str, params: Dict) -> Optional[Any]:
+        key = self._cache_key(name, params)
         if key in self._cache:
-            data, expire_at, reranked = self._cache[key]
+            data, expire_at = self._cache[key]
             if time.monotonic() < expire_at:
-                return data, reranked
+                return data
             del self._cache[key]
         return None
 
@@ -436,14 +469,12 @@ class MCPToolManager:
         params: Dict,
         data: Any,
         ttl: float,
-        rerank_top_k: int = 0,
-        reranked: bool = False,
     ) -> None:
         if len(self._cache) >= 5000:
             # 清掉最旧的 1/4
             for k in list(self._cache)[:1250]:
                 del self._cache[k]
-        self._cache[self._cache_key(name, params, rerank_top_k)] = (data, time.monotonic() + ttl, reranked)
+        self._cache[self._cache_key(name, params)] = (data, time.monotonic() + ttl)
 
     # ── 参数校验 ──────────────────────────────────────────────────────────────
 

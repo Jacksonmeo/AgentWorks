@@ -1,6 +1,6 @@
 # AgentWorks 当前实现总结与后续优化路线
 
-> 文档基线：2026-09-24 当前工作区代码与本地运行实例  
+> 文档基线：2026-09-26 当前工作区代码
 > 适用范围：当前后端工作区与同级前端工作区  
 > 文档目的：说明当前已经采用的方案、关键实现思路、已知边界，以及从“技术 Demo”继续走向产品化的建议。
 
@@ -59,7 +59,7 @@ FastAPI API
   │     └── ResponseComposer
   ├── MCPToolManager
   │     ├── 工具校验、超时、缓存、熔断、降级
-  │     └── KnowledgeBase：ChromaDB 语义检索
+  │     └── KnowledgeBase：Qdrant Dense + BM25 + RRF + CrossEncoder
   ├── SkillManager：业务规则热加载
   ├── PerformanceMonitor：指标、告警、路由降权
   └── EndToEndEvaluator：意图与回复质量评测
@@ -67,6 +67,7 @@ FastAPI API
 基础设施
   ├── Redis
   ├── ChromaDB
+  ├── Qdrant
   ├── Prometheus
   └── Nginx
 ```
@@ -78,9 +79,10 @@ FastAPI API
 | 前端 | Vue 3、Vite | 单页工作台与流式对话 |
 | Markdown | marked、DOMPurify | GFM 解析与 HTML 清洗 |
 | API | FastAPI、Pydantic | HTTP API、SSE、数据校验 |
-| 模型接入 | Anthropic 兼容 SDK | 意图、Agent 回复、改写、重排、评测 |
+| 模型接入 | Anthropic 兼容 SDK | 意图、Agent 回复、条件改写、评测 |
 | 短期记忆 | Redis | 会话最近消息和摘要 |
-| 向量存储 | ChromaDB | 知识库、情景记忆、用户画像 |
+| 知识检索 | Qdrant + FastEmbed | Dense、BM25、RRF、父子块存储和 CrossEncoder 重排 |
+| 长期记忆 | ChromaDB（过渡期） | 情景记忆、用户画像 |
 | 监控 | prometheus-client、Prometheus | Agent/工具指标采集 |
 | 部署 | Docker Compose、Nginx | 后端与基础设施编排 |
 
@@ -179,23 +181,26 @@ FastAPI API
 
 ### 3.5 RAG 与知识库
 
-知识库位于 `mcp/knowledge_base.py`，使用 ChromaDB 保存文档向量。当前主要行为是：
+知识库位于 `mcp/knowledge_base.py`，使用 Qdrant 保存父子块、Dense 向量和 BM25 稀疏向量。当前主要行为是：
 
-- 长文按约 500 字、尽量按句子边界切片。
-- ChromaDB 默认 Embedding 负责写入和查询向量化。
-- 检索结果返回标题、正文、分片位置和相关度。
+- 按标题层级构建不超过约 900 token 的父块，再切成不超过约 240 token、带约 40 token 重叠的子块。
+- 显式使用 `BAAI/bge-small-zh-v1.5` 生成中文 Dense 向量，同时使用 Qdrant BM25 多语言 tokenizer。
+- Dense 与 BM25 各召回 Top20，由 Qdrant 默认 RRF 配置融合成 12 个候选，不在应用中写死 `k=60`。
+- `BAAI/bge-reranker-base` CrossEncoder 对子块重排；证据 Gate 通过后才批量读取最多 3 个父块。
 - 导入接口支持文本录入和 `.txt`、`.md`、`.json` 文件。
 - 知识检索工具有 5 分钟 TTL 缓存。
 
-RAG 当前采用“轻路径优先”：
+RAG 当前采用“直接检索优先、最多改写一次”：
 
 ```text
-原始查询直接召回
-  ├── 有结果：去重后直接返回
-  └── 无结果：查询改写 -> 多查询并行召回 -> 去重 -> LLM 重排
+明确问题 -> Dense + BM25 -> 默认 RRF -> CrossEncoder -> 证据 Gate
+  ├── 充分：按 parent_id 去重 -> 批量读取 Top3 父块
+  └── 不足且未改写：改写一次 -> 重试同一链路
+                         ├── 充分：返回父块
+                         └── 仍不足：明确无答案
 ```
 
-这与早期“每次都改写并重排”的思路不同。对于当前规模较小的知识库，大多数查询直接召回已经足够；只有召回失败时才增加额外模型调用，以换取更好的长尾召回率。
+只有存在对话上下文且问题指代不清或过短时才预先改写；否则先直接检索。首轮证据不足时也只允许一次改写重试，不做多查询扇出。这样保留了长尾召回能力，同时控制模型调用次数和响应延迟。
 
 明确的业务意图会在 Agent 生成回复前直接预取知识，避免先让模型规划一次工具调用，再进行检索和第二次生成。问候和反馈等请求则跳过 RAG，防止无关知识污染回答。
 
@@ -210,7 +215,7 @@ RAG 当前采用“轻路径优先”：
 - 熔断器
 - fallback 降级结果
 - 调用成功率、延迟、连续失败统计
-- 可选查询改写和重排
+- 条件查询改写和检索结果元数据透传
 
 Agent 自身还通过工具白名单限制可调用范围，避免账单 Agent 随意调用技术工具或模型调用未授权能力。
 
@@ -463,12 +468,12 @@ Monitor 不只是页面展示。它会把成功率和平均延迟转换成 `moni
 
 ### 6.3 RAG
 
-- 500 字切片是通用规则，尚未针对标题层级、表格、FAQ 和代码文档优化。
-- 主要依赖向量检索，缺少 BM25/关键词混合检索。
+- 已按 Markdown 标题、段落和句子边界实现通用父子切块，但表格、代码块和 FAQ 尚无专用解析器。
+- Dense、BM25、默认 RRF 和 CrossEncoder 已接入，但 Gate 阈值仍需用固定业务问题校准。
 - 没有租户、产品、语言、版本、生效时间等 metadata 过滤。
-- 没有知识文档生命周期、版本和权限管理。
+- 已有内容哈希、文档版本和 active 标记，但还没有完整的删除 API、来源清单、权限管理和 alias 换版流程。
 - 检索质量缺少独立 Recall@K、MRR、NDCG 评测集。
-- 当前 fallback 结果也可能被当作“成功工具结果”，产品层需要更明确地区分“真实命中”和“降级说明”。
+- fallback 和无答案已通过 `sufficient=false` 区分，但仍需在完整前端交互中验证呈现方式。
 
 ### 6.4 记忆
 
@@ -608,16 +613,14 @@ composables/
 
 验收标准：至少一个业务场景能从咨询走到真实状态变更，并可审计、可重试、可人工接管。
 
-### 7.4 P1：升级 RAG
+### 7.4 P1：补齐 RAG 数据与线上校准
 
-建议按以下顺序推进：
+父子切块、显式中文 Embedding、Dense + BM25、默认 RRF、CrossEncoder、证据 Gate 与条件改写已经完成。后续只做工程收尾：
 
 1. 为知识增加租户、产品、版本、来源、更新时间和状态 metadata。
-2. 按标题层级和文档类型切片，而不是统一 500 字。
-3. 引入向量 + BM25 混合召回。
-4. 使用更轻量、稳定的 reranker，避免每次用生成模型重排。
-5. 返回引用片段和来源链接，回答中可点击查看依据。
-6. 建立独立检索评测集，观察 Recall@K、MRR 和无答案拒答准确率。
+2. 返回更完整的来源链接，让回答中的依据可点击查看。
+3. 准备一组小而固定的业务问题，校准 Gate 阈值并观察无答案误答。
+4. 将 ChromaDB 中的长期记忆迁移到 Qdrant，完成后删除过渡期服务和依赖。
 
 验收标准：每条基于知识的答案都有来源；知识无命中时明确说明，不把 fallback 文案误当作事实。
 
@@ -676,7 +679,7 @@ POST /eval/jobs/{id}/cancel -> 取消
 | 5 | 拆分 `App.vue` 和 API composables | 为后续迭代降风险 | 中 |
 | 6 | 选一个真实业务场景接入 | 从智能建议走向业务执行 | 高 |
 | 7 | 异步评测任务与历史趋势 | 建立稳定迭代闭环 | 中到高 |
-| 8 | RAG metadata、混合检索和检索评测 | 提升知识可靠性 | 高 |
+| 8 | RAG metadata、来源引用和 Gate 校准 | 提升知识可靠性 | 中 |
 | 9 | 认证、RBAC、审计、限流、租户隔离 | 满足生产要求 | 高 |
 
 建议先完成 1—4，再决定视觉细节。没有信息架构和真实工作流支撑时，只调整配色、阴影、圆角，仍然会像一个更漂亮的 Demo。
@@ -685,16 +688,14 @@ POST /eval/jobs/{id}/cancel -> 取消
 
 ## 10. 当前验证状态
 
-编写本文时已核对：
+本次 RAG 重构已核对：
 
-- Docker Compose 中 AgentWorks、Redis、ChromaDB、Prometheus、Nginx 均处于 healthy。
-- `http://localhost:8000/health` 返回正常。
-- 前端 `http://localhost:5173` 可访问。
-- SSE 已验证会发送 progress、delta、result、done，增量拼接与最终正文一致。
-- 前端生产构建此前已通过。
-- 后端现有 18 项测试已通过手工测试加载器验证，包括流式重建、续写、Composer、流式降级、工具规划与最终流式输出。容器当前未安装 pytest，因此标准 `python -m pytest` 尚不能直接执行。
+- `python -m pytest -q`：24 项测试通过。
+- 本地 Qdrant 引擎真实执行了 Dense 与中文 BM25 双路预取、默认 RRF 融合和父块读取冒烟测试。
+- `docker compose config --quiet` 通过。
+- Docker Desktop 后端因本机遗留 `dockerInference` socket 启动失败，因此本次未完成整套 Compose 容器和 HTTP 端到端验证；`docker compose config --quiet` 已通过。
 
-这些结果说明当前功能链路可以运行，但不等于已经完成生产级验证。并发容量、断线恢复、权限隔离、真实业务接口、跨版本回归和长时间稳定性仍需专项测试。
+这些结果证明检索核心和应用编排测试可用，但不等于已经完成生产级验证。模型首次下载、完整容器启动、真实 API Key 下的条件改写、并发容量和长时间稳定性仍需在可运行 Docker 的环境中复核。
 
 ---
 

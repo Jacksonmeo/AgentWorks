@@ -118,32 +118,34 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
+    # MCP 工具管理器 + Qdrant 混合检索知识库。
     _tool_manager = MCPToolManager(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
     kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        qdrant_url=os.getenv("QDRANT_URL", "http://qdrant:6333"),
+        dense_model=os.getenv("RAG_DENSE_MODEL", "BAAI/bge-small-zh-v1.5"),
+        reranker_model=os.getenv("RAG_RERANKER_MODEL", "BAAI/bge-reranker-base"),
+        model_cache_dir=os.getenv("RAG_MODEL_CACHE_DIR") or None,
+        sufficiency_threshold=float(os.getenv("RAG_SUFFICIENCY_THRESHOLD", "0.0")),
     )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+    logger.info(f"Qdrant 知识库已加载: {await kb.doc_count_async()} 个有效子块")
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
+        return {
+            "query": query,
+            "results": [],
+            "sufficient": False,
+            "reranked": False,
+            "reason": f"知识库暂时不可用: {error}",
+        }
 
     _tool_manager.register(Tool(
         name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
+        description="搜索知识库（中文 Dense + BM25 + RRF + CrossEncoder）",
         handler=kb.search_handler,
         schema={
             "type": "object",
@@ -154,7 +156,7 @@ async def lifespan(app: FastAPI):
             "required": ["query"],
         },
         cache_ttl=300.0,
-        supports_rerank=True,
+        timeout_s=float(os.getenv("RAG_TIMEOUT_S", "90")),
         fallback=knowledge_fallback,
     ))
     if _orchestrator is not None:
@@ -506,13 +508,21 @@ async def prometheus_metrics():
 @app.post("/search")
 async def search(query: str, top_k: int = 5):
     """
-    演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
+    演示检索优化链路：混合召回 → RRF → CrossEncoder → 证据 Gate → 条件改写。
     展示 MCP 工具调用的核心亮点。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
     result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    return {
+        "query": query,
+        "query_used": result.query_used,
+        "results": result.data,
+        "reranked": result.reranked,
+        "sufficient": result.sufficient,
+        "rewritten": result.rewritten,
+        "message": result.error,
+    }
 
 
 class DocInput(BaseModel):
@@ -552,7 +562,7 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    文档会进行父子切块；子块生成中文稠密向量和 BM25 表示后写入 Qdrant，父块单独保存并延迟读取。
 
     示例请求体：
     ```json

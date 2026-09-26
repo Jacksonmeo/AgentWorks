@@ -198,6 +198,87 @@ def test_rag_uses_direct_result_without_query_rewrite():
     assert len(calls) == 1
 
 
+def test_rag_rewrites_once_when_sufficiency_gate_rejects_first_search():
+    manager = MCPToolManager(api_key="test-key", model="test-model")
+    calls = []
+    responses = [
+        ToolResult(
+            success=True,
+            data={
+                "results": [],
+                "sufficient": False,
+                "reranked": True,
+                "reason": "证据不足",
+            },
+            tool_name="knowledge_search",
+        ),
+        ToolResult(
+            success=True,
+            data={
+                "results": [{"parent_id": "p1", "title": "退款政策", "content": "七天内可退款"}],
+                "sufficient": True,
+                "reranked": True,
+            },
+            tool_name="knowledge_search",
+        ),
+    ]
+
+    async def fake_call(name, params, context=None, **kwargs):
+        calls.append(params["query"])
+        return responses.pop(0)
+
+    async def rewrite(query, context=None):
+        return "购买后多少天内可以申请退款"
+
+    manager.call = fake_call
+    manager.rewrite_query = rewrite
+
+    result = asyncio.run(manager.search_with_rewrite("knowledge_search", "退款期限"))
+
+    assert calls == ["退款期限", "购买后多少天内可以申请退款"]
+    assert result.sufficient is True
+    assert result.rewritten is True
+    assert result.query_used == "购买后多少天内可以申请退款"
+    assert result.data[0]["parent_id"] == "p1"
+
+
+def test_context_dependent_query_uses_only_one_rewrite_attempt():
+    manager = MCPToolManager(api_key="test-key", model="test-model")
+    calls = []
+    rewrite_calls = []
+
+    async def fake_call(name, params, context=None, **kwargs):
+        calls.append(params["query"])
+        return ToolResult(
+            success=True,
+            data={
+                "results": [],
+                "sufficient": False,
+                "reranked": True,
+                "reason": "证据不足",
+            },
+            tool_name=name,
+        )
+
+    async def rewrite(query, context=None):
+        rewrite_calls.append(query)
+        return "退款审核需要多久"
+
+    manager.call = fake_call
+    manager.rewrite_query = rewrite
+
+    result = asyncio.run(manager.search_with_rewrite(
+        "knowledge_search",
+        "这个呢",
+        context={"history": [{"role": "user", "content": "退款审核一般要多久"}]},
+    ))
+
+    assert rewrite_calls == ["这个呢"]
+    assert calls == ["退款审核需要多久"]
+    assert result.sufficient is False
+    assert result.rewritten is True
+
+
 def test_routing_decision_can_target_escalation_pool():
     # Keep this assertion close to the public data contract used by the API.
     decision = RoutingDecision(
@@ -225,7 +306,7 @@ def test_agent_tool_scopes_are_real_and_isolated():
 
 def test_shared_rag_tool_is_available_to_all_agents():
     class RagManager:
-        async def search_with_rewrite(self, tool_name, query, top_k=5):
+        async def search_with_rewrite(self, tool_name, query, top_k=5, context=None):
             return type(
                 "Result",
                 (),
@@ -247,7 +328,7 @@ def test_shared_rag_tool_is_available_to_all_agents():
 
 def test_specific_agent_prefetches_rag_before_single_llm_call():
     class RagManager:
-        async def search_with_rewrite(self, tool_name, query, top_k=5):
+        async def search_with_rewrite(self, tool_name, query, top_k=5, context=None):
             return ToolResult(
                 success=True,
                 data=[{"title": "技术故障排查", "content": "401 表示认证失败"}],

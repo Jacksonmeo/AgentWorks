@@ -1,5 +1,5 @@
 # AgentWorks 智能客服系统 — Docker Compose 服务编排
-# 三级记忆架构：Redis（工作记忆）+ ChromaDB（情景记忆 + 用户画像）
+# 存储架构：Redis（工作记忆）+ ChromaDB（过渡期长期记忆）+ Qdrant（RAG）
 
 name: agentworks
 
@@ -45,6 +45,18 @@ services:
       retries: 3
       start_period: 10s
 
+  # ── Qdrant（知识库 Dense + BM25 + RRF）─────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    container_name: agentworks-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - agentworks-network
+
   # ── Prometheus 监控 ─────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
@@ -85,6 +97,8 @@ services:
       # 容器内固定值，覆盖 .env 中的本地路径
       - REDIS_URL=redis://:${REDIS_PASSWORD:-agentworks123}@redis:6379/0
       - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
+      - QDRANT_URL=http://qdrant:6333
+      - RAG_MODEL_CACHE_DIR=/app/data/models
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - AGENTWORKS_SKILLS_DIR=/app/skills
     volumes:
@@ -92,11 +106,14 @@ services:
       - ./data/eval:/app/data/eval
       - ./skills:/app/skills
       - ./logs:/app/logs
+      - rag-model-cache:/app/data/models
     depends_on:
       redis:
         condition: service_healthy
       chromadb:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     restart: unless-stopped
     networks:
       - agentworks-network
@@ -141,5 +158,7 @@ networks:
 volumes:
   redis-data:
   chromadb-data:
+  qdrant-data:
+  rag-model-cache:
   prometheus-data:
   nginx-logs:

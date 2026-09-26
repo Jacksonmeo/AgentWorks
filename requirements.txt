@@ -11,7 +11,8 @@ python-multipart==0.0.12    # FastAPI 文件上传支持
 
 # ── 数据存储 ──────────────────────────────────────────────────────────────────
 redis==5.2.1
-chromadb==0.5.23           # 向量数据库（长期记忆）
+chromadb==0.5.23           # 过渡期：情景记忆与用户画像，后续迁移到 Qdrant
+qdrant-client[fastembed]==1.19.1  # RAG：Qdrant 客户端 + ONNX 中文 Embedding / CrossEncoder
 
 # ── 监控 ──────────────────────────────────────────────────────────────────────
 prometheus-client==0.21.1
