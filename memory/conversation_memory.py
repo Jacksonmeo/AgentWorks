@@ -21,7 +21,6 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
@@ -96,6 +95,7 @@ class MemoryManager:
         api_key:      str = "",
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
+        enable_long_term_memory: bool = True,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -105,7 +105,15 @@ class MemoryManager:
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
 
+        if not enable_long_term_memory:
+            self._episodic = None
+            self._profile = None
+            logger.info("长期记忆已关闭，仅使用 Redis 工作记忆")
+            return
+
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
+        import chromadb
+
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
             chroma = chromadb.HttpClient(
@@ -165,6 +173,9 @@ class MemoryManager:
         从当前工作记忆中提炼用户偏好，更新用户画像。
         用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
         """
+        if self._profile is None:
+            return
+
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
@@ -329,6 +340,8 @@ class MemoryManager:
 
     async def _search_episodic(self, user_id: str, conv_id: str, query: str) -> List[str]:
         """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        if self._episodic is None:
+            return []
         query_text = self._safe_text(query).strip()
         if not query_text:
             return []
@@ -358,6 +371,8 @@ class MemoryManager:
 
     async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str) -> None:
         """将压缩后的对话片段存入情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        if self._episodic is None:
+            return
         try:
             user_id = self._safe_text(user_id)
             conv_id = self._safe_text(conv_id)
@@ -377,6 +392,8 @@ class MemoryManager:
 
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
         """获取用户画像（取最新一条）。"""
+        if self._profile is None:
+            return {}
         try:
             doc_id = self._profile_doc_id(user_id)
             direct = await asyncio.to_thread(self._profile.get, ids=[doc_id])

@@ -116,6 +116,8 @@ async def lifespan(app: FastAPI):
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        enable_long_term_memory=os.getenv("MEMORY_LONG_TERM_ENABLED", "true").lower()
+        not in {"0", "false", "no"},
     )
 
     # MCP 工具管理器 + Qdrant 混合检索知识库。

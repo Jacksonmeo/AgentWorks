@@ -65,7 +65,13 @@ class KnowledgeBase:
         reranker: Optional[Any] = None,
         load_default_docs: bool = True,
     ):
-        self._client = client or QdrantClient(url=qdrant_url, timeout=30)
+        if client is not None:
+            self._client = client
+        elif qdrant_url.strip() == ":memory:":
+            # 本地演示/测试模式，不依赖独立 Qdrant 服务；进程退出后数据清空。
+            self._client = QdrantClient(location=":memory:")
+        else:
+            self._client = QdrantClient(url=qdrant_url, timeout=30)
         self._embedder = embedder or TextEmbedding(
             model_name=dense_model,
             cache_dir=model_cache_dir,

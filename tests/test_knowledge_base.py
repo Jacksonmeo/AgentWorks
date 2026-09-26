@@ -87,6 +87,17 @@ def build_kb(client, scores, threshold=0.0):
     )
 
 
+def test_in_memory_qdrant_mode_supports_local_demo_without_server():
+    kb = KnowledgeBase(
+        qdrant_url=":memory:",
+        embedder=FakeEmbedder(),
+        reranker=FakeReranker([]),
+        load_default_docs=False,
+    )
+
+    assert kb.doc_count == 0
+
+
 def test_parent_child_chunking_preserves_heading_and_limits_child_size():
     content = "# 登录问题\n" + "登录失败，请检查验证码。" * 100
 
